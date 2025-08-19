@@ -1,0 +1,163 @@
+# Terraform Plan & Apply Pipeline (with manual approval)
+# Code Summary:
+  # Perform Terraform Plan & Apply with (manual) approval via Azure DevOps.
+
+### CHANGE THE VARIABLE VALUES BELOW TO YOUR OWN SETTINGS ###
+variables:
+    serviceConnectionName: "<your service principal>"                 # Specify service connection name.
+    storageAccountResourceGroupName: "<your resource group name>"     # Specify Resource Group name. This is needed for the Terraform backend.
+    storageAccountName: "<your storage account name>"                 # Specify Storage Account name. This is needed for the Terraform backend.
+    blobContainerName: "<your blob container name>"                   # Specify Blob Container name. This is needed for the Terraform backend.
+    tfStateName: "<define your tfstate name>.tfstate"                 # Specify Terraform state file name. This is needed for the Terraform backend.  
+### CHANGE THE VARIABLE VALUES ABOVE TO YOUR OWN SETTINGS ###
+
+trigger:
+  - main
+
+# Custom Agent Pool to use for which environment.
+
+resources:
+  containers:
+  - container: '<your container name>'      
+    image: '<your image name>'
+    endpoint: '<your endpoint registry name>'
+
+stages:
+
+  # Terraform Plan Stage
+  - stage: TerraformPlan
+    displayName: Create Terraform Plan
+
+    pool:
+      name: <your agent pool name>
+
+    jobs:
+    
+      - job: terraformJobPlan
+        container: <your container name>
+        displayName: Terraform Plan
+        steps:
+          - checkout: self
+
+        # Perform Terraform Init to download providers and initialize the backend.
+          - task: TerraformTask@5
+            displayName: Initialize Terraform
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'              
+              backendServiceArm: $(serviceConnectionName)
+              backendAzureRmResourceGroupName: $(storageAccountResourceGroupName)
+              backendAzureRmstorageAccountName: $(storageAccountName)
+              backendAzureRmContainerName: $(blobContainerName)
+              backendAzureRmKey: $(tfStateName)
+
+          # Perform Terraform Plan to create a Tfplan file.
+          - task: TerraformTask@5
+            displayName: Terraform Plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              commandOptions: '-out=$(Build.SourcesDirectory)/tfplan'              
+              backendServiceArm: $(serviceConnectionName)
+              backendAzureRmResourceGroupName: $(storageAccountResourceGroupName)
+              backendAzureRmstorageAccountName: $(storageAccountName)
+              backendAzureRmContainerName: $(blobContainerName)
+              backendAzureRmKey: $(tfStateName)
+              environmentServiceNameAzureRM: '$(serviceConnectionName)'               
+              allowTelemetryCollection: true
+
+          # Create a Terraform Tfplan artifact to be used in the next stage to avoid configuration drift if someone else uses the pipeline simultaneously.
+          - task: ArchiveFiles@2
+            displayName: 'Plan Artifact'
+            inputs:
+              rootFolderOrFile: '$(Build.SourcesDirectory)'
+              includeRootFolder: false
+              archiveType: 'tar'
+              tarCompression: 'gz'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).tgz'
+              replaceExistingArchive: true
+
+          # Publish the Terraform plan artifact so it can be used in the next 
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'   
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: '$(Build.BuildId)-tfplan'
+              publishLocation: 'Container'
+
+          # Remove unneeded files to keep the build artifact clean.    
+          - task: DeleteFiles@1
+            displayName: 'Remove unneeded files'
+            inputs:
+              contents: |
+                .terraform                                                        
+
+ ###########################################################################################
+ # Manual Approval Terraform 
+ ###########################################################################################
+  - stage: TerraformManualApply
+    displayName: Terraform Manual Apply
+    
+    pool:
+      name: <your agent pool name>
+        
+    dependsOn: TerraformPlan
+    
+    jobs:
+      - job: waitForValidation
+        displayName: "Wait for manual appoval"
+        timeoutInMinutes: "4320" # job times out in 3 days
+        pool: server # This job needs to run on the DevOps server instead on the agent pool
+        steps:
+
+          - task: ManualValidation@0
+            timeoutInMinutes: "1440" # task times out in 1 day
+            inputs:
+
+            # Extra Code whether a team wants approval via Azure DevOps Groups or not.
+              #   notifyUsers: |
+              #     [Project Name]\AzureDevOpsGroupName
+              instructions: "Continue with Terraform Apply?"
+              onTimeout: "reject"
+      
+      # Manual Validation job to wait for manual approval before applying the Terraform plan.
+      - job: TerraformApply
+        displayName: Terraform apply - manual
+        dependsOn: waitForValidation
+        condition: succeeded()
+        workspace:
+          clean: all
+        container: '<your container name>'
+
+        steps:
+          - checkout: none
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Plan Artifact'
+            inputs:
+              artifactName: '$(Build.BuildId)-tfplan'
+          - task: ExtractFiles@1
+            displayName: 'Extract Terraform Plan Artifact'
+            inputs:
+              archiveFilePatterns: '$(System.ArtifactsDirectory)/$(Build.BuildId)-tfplan/$(Build.BuildId).tgz'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/'
+              cleanDestinationFolder: true
+          - task: TerraformTask@5
+            displayName: Initialize Terraform
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: $(serviceConnectionName)
+              backendAzureRmResourceGroupName: $(storageAccountResourceGroupName)
+              backendAzureRmstorageAccountName: $(storageAccountName)
+              backendAzureRmContainerName: $(blobContainerName)
+              backendAzureRmKey: $(tfStateName)
+          - task: TerraformTask@5
+            displayName: Terraform Apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: 'tfplan'
+              environmentServiceNameAzureRM: $(serviceConnectionName)
