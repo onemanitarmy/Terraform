@@ -1,0 +1,207 @@
+### RUN THIS PIPELINE ONLY ONCE PER SUBSCRIPTION ENVIRONMENT AND NEVER AGAIN! ###
+
+# Preparations file to create Storage Account in advance to save .tfstate file.
+# Code Summary:
+  # Create Storage Account
+    # Assign RBAC Role 'Storage Blob Data Contributor' on Storage Account to create and write tfstate file in Blob Container.
+    # Create Blob Container
+    # Create Private Endpoint for Storage Account to access it privately.
+    # Create Private DNS Zone A record for Storage Account Blob Private Endpoint.
+
+# User must fill these values in before running the pipeline (this is done via AzureDevOps, not here):
+parameters:
+  - name: WorkloadID
+    type: number
+    displayName: Fill in your Workload ID
+  - name: EnvironmentSubscription
+    type: string
+    displayName: Select Subscription Environment of your Workload.
+    values:
+      - NonProdSubscription-Development
+      - NonProdSubscription-Test
+      - ProdSubscription-Acceptance
+      - ProdSubscription-Production
+  - name: VirtualNetworkName
+    type: string
+    displayName: Fill in your Virtual Network Name
+  - name: PrivateEndpointSubnetName
+    type: string
+    displayName: Fill in your PE Subnet Name
+  - name: ServiceConnectionName
+    type: string
+    displayName: Fill in your Service Connection Name
+
+variables:
+  # Variables for NonProd Subscriptions.
+  - ${{ if eq(parameters.EnvironmentSubscription, 'NonProdSubscription-Development') }}:
+    - name: environmentLetter
+      value: "n"
+    - name: environmentNumber
+      value: "1000"
+  - ${{ if eq(parameters.EnvironmentSubscription, 'NonProdSubscription-Test') }}:
+    - name: environmentLetter
+      value: "n"
+    - name: environmentNumber
+      value: "2000"
+
+  # Variables for Prod Subscriptions.
+  - ${{ if eq(parameters.EnvironmentSubscription, 'ProdSubscription-Acceptance') }}:
+    - name: environmentLetter
+      value: "p"
+    - name: environmentNumber
+      value: "3000"
+  - ${{ if eq(parameters.EnvironmentSubscription, 'ProdSubscription-Production') }}:
+    - name: environmentLetter
+      value: "p"
+    - name: environmentNumber
+      value: "4000"
+
+
+# Do not trigger this pipeline automatically since this pipeline is a one-time preparation pipeline to run.
+trigger:
+  - none
+
+# Custom Agent Pool to use for which environment.
+resources:
+  containers:
+  - container: '<container-name>'   
+    image: '<image-name>'
+    endpoint: '<endpoint-name>'
+
+# Custom Agent to use
+# Agent Pool to use
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+
+  # Terraform Plan Stage
+  - stage: TerraformPlan
+    displayName: Create Terraform Plan
+
+    pool:
+      # name: snbv-ubuntu-22.04-development - recommended for NonProd Subscription usage. Uncomment this line and comment the next line if you want to use this pool.
+        name: <your pool name>    
+
+    jobs:
+      - job: terraformJobPlan
+        container: terraform_container
+        displayName: Terraform Plan
+        steps:
+          - checkout: self
+
+        # Perform Terraform Init to download providers and initialize the backend.
+        # Use Bash@3 instead of TerraformTask@5 to avoid using backend mandatory fields to fill in.                                           
+          - task: Bash@3
+            displayName: 'Terraform Init (no backend)'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              script: |
+                terraform init -backend=false
+
+          # Perform Terraform Plan to create a Tfplan file.
+          - task: TerraformTask@5
+            displayName: Terraform Plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              commandOptions: ' -var="workload_id"=${{ parameters.WorkloadID }}
+                                -var="env_letter"=$(environmentLetter)
+                                -var="env_number"=$(environmentNumber)
+                                -var="vnetName"=${{ parameters.VirtualNetworkName }}
+                                -var="subnetName"=${{ parameters.PrivateEndpointSubnetName }}
+                                -out=$(Build.SourcesDirectory)/tfplan'                                                         
+              environmentServiceNameAzureRM: ${{ parameters.ServiceConnectionName }}               
+              allowTelemetryCollection: true
+
+          # Create a Terraform Tfplan artifact to be used in the next stage to avoid configuration drift if someone else uses the pipeline simultaneously.
+          - task: ArchiveFiles@2
+            displayName: 'Plan Artifact'
+            inputs:
+              rootFolderOrFile: '$(Build.SourcesDirectory)'
+              includeRootFolder: false
+              archiveType: 'tar'
+              tarCompression: 'gz'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).tgz'
+              replaceExistingArchive: true
+
+          # Publish the Terraform plan artifact so it can be used in the next 
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'   
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: '$(Build.BuildId)-tfplan'
+              publishLocation: 'Container'
+
+          # Remove unneeded files to keep the build artifact clean.    
+          - task: DeleteFiles@1
+            displayName: 'Remove unneeded files'
+            inputs:
+              contents: |
+                .terraform                                                        
+
+  - stage: TerraformApply
+    displayName: Terraform Apply
+    dependsOn: TerraformPlan
+    condition: succeeded()
+
+    pool:
+      # name: snbv-ubuntu-22.04-development - recommended for NonProd Subscription usage. Uncomment this line and comment the next line if you want to use this pool.
+        name: <your pool name>    
+    
+    jobs:     
+        # Terraform Apply job to apply the Terraform plan after manual approval.
+      - job: TerraformApply
+        container: terraform_container      
+        displayName: Terraform Apply
+        steps:            
+          # Download the Terraform plan artifact created in the previous stage.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Plan Artifact'
+            inputs:
+              artifactName: '$(Build.BuildId)-tfplan'
+
+          # Extract the Terraform plan artifact to the working directory.
+          - task: ExtractFiles@1
+            displayName: 'Extract Terraform Plan Artifact'
+            inputs:
+              archiveFilePatterns: '$(System.ArtifactsDirectory)/$(Build.BuildId)-tfplan/$(Build.BuildId).tgz'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/'
+              cleanDestinationFolder: true
+
+        # Perform Terraform Init to download providers and initialize the backend.
+        # Use Bash@3 instead of TerraformTask@5 to avoid using backend mandatory fields to fill in.                                           
+          - task: Bash@3
+            displayName: 'Terraform Init (no backend)'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              script: |
+                terraform init -backend=false
+
+          # Perform Terraform Plan to create a Tfplan file.
+          - task: TerraformTask@5
+            displayName: Terraform Plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              commandOptions: ' -var="workload_id"=${{ parameters.WorkloadID }}
+                                -var="env_letter"=$(environmentLetter)
+                                -var="env_number"=$(environmentNumber)
+                                -var="vnetName"=${{ parameters.VirtualNetworkName }}
+                                -var="subnetName"=${{ parameters.PrivateEndpointSubnetName }}
+                                -out=$(Build.SourcesDirectory)tfplan'                                                    
+              environmentServiceNameAzureRM: ${{ parameters.ServiceConnectionName }}               
+              allowTelemetryCollection: true                                                    
+
+          # Perform Terraform Apply using the plan file saved in the artifact in previous stage.
+          - task: TerraformTask@5
+            displayName: Terraform Apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: 'tfplan'
+              environmentServiceNameAzureRM: ${{ parameters.ServiceConnectionName }}
