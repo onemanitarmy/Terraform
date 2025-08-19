@@ -1,0 +1,94 @@
+### RUN THIS PIPELINE ONLY ONCE AND NEVER AGAIN! ###
+
+# Preparations file to create Storage Account in advance to save .tfstate file.
+# Code Summary:
+  # Create Storage Account
+  # Assign RBAC Role 'Storage Blob Data Contributor' on Storage Account to create and write tfstate file in Blob Container.
+  # Create Blob Container and store Terraform .tfstate file.
+
+
+### CHANGE THE VARIABLE VALUES BELOW TO YOUR OWN SETTINGS ###
+variables:
+    ServiceConnectionName: "<your service connection name>"                         # Specify service connection name in Azure DevOps project settings.
+    StorageAccountResourceGroupName: "<your resource group name>"                   # Specify Resource Group name.
+    StorageAccountName: "<your storage account name>"                               # Specify Storage Account name.
+    BlobContainerName: "<your blob container name>"                                 # Specify Blob Container name.
+    Location: "westeurope"                                                          # Specify Location.
+    SPApplicationID: "<your service principal application object id>"               # Specify Service Principal Application (Client) ID for RBAC Role Assignment.
+### CHANGE THE VARIABLE VALUES ABOVE TO YOUR OWN SETTINGS ###
+
+# Do not trigger this pipeline automatically since this pipeline is a one-time preparation pipeline to run.
+trigger:
+  - none
+
+# Agent Pool to use
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: TerraformState
+    jobs:
+    - job: CreateStorageAccount
+      continueOnError: false
+      steps:
+        - task: AzurePowerShell@5
+          displayName: 'Create Storage Account'
+          inputs:
+            azureSubscription: '$(ServiceConnectionName)'
+            azurePowerShellVersion: 'LatestVersion'
+            ScriptType: 'InlineScript'
+            Inline: |                                     # Powershell Inline commands
+              # Create Storage Account
+              echo "Creating Storage Account '$(StorageAccountName)' ..."
+              New-AzStorageAccount -ResourceGroupName '$(StorageAccountResourceGroupName)' -Name '$(StorageAccountName)' -Location '$(Location)' -SkuName Standard_LRS -Kind StorageV2
+              echo "Storage Account '$(StorageAccountName)' created successfully!"
+  
+    - job: AssignStorageBlobDataContributorRole 
+      dependsOn: CreateStorageAccount
+      steps:      
+        - task: AzurePowerShell@5
+          displayName: 'Assign TFstate Role'
+          inputs:
+            azureSubscription: '$(ServiceConnectionName)'
+            azurePowerShellVersion: 'LatestVersion'
+            ScriptType: 'InlineScript'
+            Inline: |
+              # Assign RBAC Role 'Storage Blob Data Contributor' on Storage Account to create and write tfstate file in Blob Container.
+              echo " Getting '$(StorageAccountName)' ID value ..." 
+              $storageAccountId = (Get-AzStorageAccount -ResourceGroupName '$(StorageAccountResourceGroupName)' -Name '$(StorageAccountName)').Id
+              
+              echo "Assigning RBAC Role 'Storage Blob Data Contributor'  Service Principal Application ID '$(SPApplicationID)' on Storage Account '$(StorageAccountName)' ..."
+              $scope = $storageAccountId
+              New-AzRoleAssignment -ApplicationId '$(SPApplicationID)' -RoleDefinitionName 'Storage Blob Data Contributor' -Scope $scope
+              echo "RBAC assignment successful!"
+
+    - job: CreateBlobContainer
+      dependsOn: AssignStorageBlobDataContributorRole      
+      steps:   
+        - task: AzurePowerShell@5
+          displayName: 'Create Blob Container'
+          inputs:
+            azureSubscription: '$(ServiceConnectionName)'
+            azurePowerShellVersion: 'LatestVersion'
+            ScriptType: 'InlineScript'
+            Inline: |              
+              # Select Storage Account and create Blob Container.
+              $context = New-AzStorageContext -StorageAccountName '$(StorageAccountName)' -UseConnectedAccount
+              echo "Creating Blob Container '$(BlobContainerName)' in Storage Account '$(StorageAccountName)' ..."
+              New-AzStorageContainer -Name '$(BlobContainerName)' -Context $context
+              echo "Blob Container '$(BlobContainerName)' created successfully!"
+
+    - job: DisablePublicNetworkAccess
+      dependsOn: CreateBlobContainer
+      steps:
+        - task: AzurePowerShell@5
+          displayName: 'Disable Public Network Access Storage Account'
+          inputs:
+            azureSubscription: '$(ServiceConnectionName)'
+            azurePowerShellVersion: 'LatestVersion'
+            ScriptType: 'InlineScript'
+            Inline: |
+              echo "Disabling Public Network Access for Storage Account '$(StorageAccountName)' ..."
+              # Select Storage Account and disabled Public Network Access for security reasons.
+              Set-AzStorageAccount -ResourceGroupName '$(StorageAccountResourceGroupName)' -Name '$(StorageAccountName)' -PublicNetworkAccess Disabled
+              echo "Public Network Access disabled for Storage Account '$(StorageAccountName)'."
