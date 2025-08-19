@@ -1,0 +1,212 @@
+# Terraform Plan > Manual Approval > Apply Pipeline
+# Code Summary:
+  # Perform Terraform Init to download providers and initialize the backend.
+  # Perform Terraform Plan to create a Tfplan file.
+  # Create a Terraform Tfplan artifact to be used in the next stage to avoid configuration drift if someone else uses the pipeline simultaneously.
+
+
+### CHANGE THE VARIABLE VALUES BELOW TO YOUR OWN SETTINGS ###
+variables:
+    ServiceConnectionName: "<your service connection name>"                         # Specify service connection name in Azure DevOps project settings.
+    StorageAccountResourceGroupName: "<your resource group name>"                   # Specify Resource Group name.
+    StorageAccountName: "<your storage account name>"                               # Specify Storage Account name.
+    BlobContainerName: "<your blob container name>"                                 # Specify Blob Container name.
+    TfStateName: "<your terraform state file name>"                                 # Specify Terraform state file name.
+    WorkingDirectory: '$(System.DefaultWorkingDirectory)'                           # Specify working directory for Terraform files (can be ignored if you work in root directory).    
+### CHANGE THE VARIABLE VALUES ABOVE TO YOUR OWN SETTINGS ###
+
+trigger:
+  - main
+
+# Agent Pool to use
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+
+  # Enable Public Network Access of TFState Storage Account.
+  - stage: EnablePublicNetworkAccess
+    displayName: Enable Public Access Storage Account
+    jobs:
+    - job: EnablePublicNetworkAccess
+      steps:
+        - task: AzurePowerShell@5
+          displayName: 'Enable Public Network Access Storage Account'
+          inputs:
+            azureSubscription: '$(ServiceConnectionName)'
+            azurePowerShellVersion: 'LatestVersion'
+            ScriptType: 'InlineScript'
+            Inline: |
+              echo "Disabling Public Network Access for Storage Account '$(StorageAccountName)' ..."
+              # Select Storage Account and Enable Public Network Access for security reasons.
+              Set-AzStorageAccount -ResourceGroupName '$(StorageAccountResourceGroupName)' -Name '$(StorageAccountName)' -PublicNetworkAccess Enabled
+              echo "Public Network Access Enabled for Storage Account '$(StorageAccountName)'."
+
+  # Terraform Plan Stage
+  - stage: TerraformPlan
+    displayName: Create Terraform Plan
+    dependsOn: EnablePublicNetworkAccess
+    jobs:
+      - job: terraformJobPlan
+        displayName: Terraform Plan
+        steps:
+          # Install Terraform on Agent.
+          ### This task can be removed if Terraform is already installed on the Agent. ###           
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1 # Specify full name of Marketplace extension to avoid conflicts with other Terraform tasks.
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 'latest' # Not recommended to use 'latest' in production, specify a version instead in the future.
+
+        # Perform Terraform Init to download providers and initialize the backend.
+          - task: TerraformTask@5
+            displayName: Initialize Terraform
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: $(ServiceConnectionName)
+              backendAzureRmResourceGroupName: $(StorageAccountResourceGroupName)
+              backendAzureRmStorageAccountName: $(StorageAccountName)
+              backendAzureRmContainerName: $(BlobContainerName)
+              backendAzureRmKey: $(TfStateName)
+
+          # Perform Terraform Plan to create a Tfplan file.
+          - task: TerraformTask@5
+            displayName: Terraform Plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(WorkingDirectory)'
+              commandOptions: '-out=$(Build.SourcesDirectory)/tfplan'              
+              backendServiceArm: $(ServiceConnectionName)
+              backendAzureRmResourceGroupName: $(StorageAccountResourceGroupName)
+              backendAzureRmStorageAccountName: $(StorageAccountName)
+              backendAzureRmContainerName: $(BlobContainerName)
+              backendAzureRmKey: $(TfStateName)
+              environmentServiceNameAzureRM: '$(ServiceConnectionName)'               
+              allowTelemetryCollection: true
+
+          # Create a Terraform Tfplan artifact to be used in the next stage to avoid configuration drift if someone else uses the pipeline simultaneously.
+          - task: ArchiveFiles@2
+            displayName: 'Plan Artifact'
+            inputs:
+              rootFolderOrFile: '$(Build.SourcesDirectory)'
+              includeRootFolder: false
+              archiveType: 'tar'
+              tarCompression: 'gz'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).tgz'
+              replaceExistingArchive: true
+
+          # Publish the Terraform plan artifact so it can be used in the next 
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'   
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: '$(Build.BuildId)-tfplan'
+              publishLocation: 'Container'
+
+          # Remove unneeded files to keep the build artifact clean.    
+          - task: DeleteFiles@1
+            displayName: 'Remove unneeded files'
+            inputs:
+              contents: |
+                .terraform                                                        
+
+  # Terraform Manual Apply Stage
+  # This stage is used to manually apply the Terraform plan created in the previous stage.            
+  - stage: TerraformApprovalGate
+    displayName: Approve Changes
+    dependsOn: TerraformPlan
+    jobs:
+        # Manual Validation job to wait for manual approval before applying the Terraform plan.
+      - job: WaitForValidation
+        displayName: Wait for Manual Approval.
+        timeoutInMinutes: "4320" # 3 days timer before manual approval is timed out.
+        pool: server # Use server pool to run this job on the server, not on an agent - this is required for Task: ManualValidation@0 to work properly.        
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "1440" # Pipeline task times out in 1 day.   
+            inputs:
+              notifyUsers: '' # Keep it empty so the pipeline can continue, but still requires manual approval.
+              instructions: "Please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+  - stage: TerraformApply
+    displayName: Terraform Apply
+    dependsOn: TerraformApprovalGate
+    condition: succeeded()
+    jobs: 
+        # Terraform Apply job to apply the Terraform plan after manual approval.
+      - job: TerraformApply
+        displayName: Terraform Apply
+        steps:            
+          # Download the Terraform plan artifact created in the previous stage.
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Plan Artifact'
+            inputs:
+              artifactName: '$(Build.BuildId)-tfplan'
+
+          # Extract the Terraform plan artifact to the working directory.
+          - task: ExtractFiles@1
+            displayName: 'Extract Terraform Plan Artifact'
+            inputs:
+              archiveFilePatterns: '$(System.ArtifactsDirectory)/$(Build.BuildId)-tfplan/$(Build.BuildId).tgz'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/'
+              cleanDestinationFolder: true
+
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1 # Specify full name of Marketplace extension to avoid conflicts with other Terraform tasks.
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 'latest' # Not recommended to use 'latest' in production, specify a version instead in the future.  
+
+          # Perform Terraform Init to download providers and initialize the backend.
+          - task: TerraformTask@5
+            displayName: Initialize Terraform
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: $(ServiceConnectionName)
+              backendAzureRmResourceGroupName: $(StorageAccountResourceGroupName)
+              backendAzureRmStorageAccountName: $(StorageAccountName)
+              backendAzureRmContainerName: $(BlobContainerName)
+              backendAzureRmKey: $(TfStateName)
+
+          # Perform Terraform Apply using the plan file saved in the artifact in previous stage.
+          - task: TerraformTask@5
+            displayName: Terraform Apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              commandOptions: 'tfplan'
+              environmentServiceNameAzureRM: $(ServiceConnectionName)
+
+          - task: AzurePowerShell@5
+            displayName: 'Disable Public Network Access Storage Account'
+            inputs:
+              azureSubscription: '$(ServiceConnectionName)'
+              azurePowerShellVersion: 'LatestVersion'
+              ScriptType: 'InlineScript'
+              Inline: |
+                echo "Disabling Public Network Access for Storage Account '$(StorageAccountName)' ..."
+                # Select Storage Account and disabled Public Network Access for security reasons.
+                Set-AzStorageAccount -ResourceGroupName '$(StorageAccountResourceGroupName)' -Name '$(StorageAccountName)' -PublicNetworkAccess Disabled
+                echo "Public Network Access disabled for Storage Account '$(StorageAccountName)'."
+
+  # Incase an error occurs during any stage/job/step/task, this stage will run to disable public network access of the TFState Storage Account.
+  - stage: ErrorHandling
+    displayName: ErrorHandling
+    condition: failed() # This stage will run only if the previous stage(s) fails.
+    jobs:
+    - job: DisablePublicNetworkAccess
+      steps:
+        - task: AzurePowerShell@5
+          displayName: 'Disable Public Network Access Storage Account'
+          inputs:
+            azureSubscription: '$(ServiceConnectionName)'
+            azurePowerShellVersion: 'LatestVersion'
+            ScriptType: 'InlineScript'
+            Inline: |
+              echo "Disabling Public Network Access for Storage Account '$(StorageAccountName)' ..."
+              # Select Storage Account and disabled Public Network Access for security reasons.
+              Set-AzStorageAccount -ResourceGroupName '$(StorageAccountResourceGroupName)' -Name '$(StorageAccountName)' -PublicNetworkAccess Disabled
+              echo "Public Network Access disabled for Storage Account '$(StorageAccountName)'."
